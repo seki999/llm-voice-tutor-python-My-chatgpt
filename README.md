@@ -22,7 +22,7 @@ python app.py
 然后浏览器打开：
 
 ```text
-http://127.0.0.1:7860
+http://127.0.0.1:7861
 ```
 
 ## 使用 OpenAI API
