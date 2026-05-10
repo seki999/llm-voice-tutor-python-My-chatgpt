@@ -134,6 +134,58 @@ TEMP_AUDIO_FILES: List[str] = []
 # ============================================================
 # OpenAI / Local LLM
 # ============================================================
+
+def normalize_llm_reply_content(content) -> str:
+    """
+    Some OpenAI-compatible APIs return content as:
+      [{"text": "...", "type": "text"}]
+    instead of a plain string.
+
+    This function extracts only the human-readable text so the UI and TTS
+    will not display/read extra symbols like [{'text': ..., 'type': 'text'}].
+    """
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        raw = content.strip()
+
+        # Sometimes the API/client converts list content into a string like:
+        # "[{'text': 'hello', 'type': 'text'}]"
+        # Try to safely parse it and extract text.
+        if raw.startswith("[") and raw.endswith("]") and "'text'" in raw:
+            try:
+                import ast
+                parsed = ast.literal_eval(raw)
+                return normalize_llm_reply_content(parsed)
+            except Exception:
+                return raw
+
+        return raw
+
+    if isinstance(content, list):
+        parts = []
+
+        for item in content:
+            if isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item.get("text", "")))
+                elif "content" in item:
+                    parts.append(str(item.get("content", "")))
+            else:
+                parts.append(str(item))
+
+        return "\n".join([p.strip() for p in parts if p and p.strip()]).strip()
+
+    if isinstance(content, dict):
+        if "text" in content:
+            return str(content.get("text", "")).strip()
+        if "content" in content:
+            return normalize_llm_reply_content(content.get("content"))
+        return str(content).strip()
+
+    return str(content).strip()
+
 def load_openai_api_key() -> str:
     env_key = os.getenv("OPENAI_API_KEY", "").strip()
     if env_key:
@@ -228,7 +280,7 @@ def call_local_llm(system_prompt: str, user_message: str, history: List[Dict[str
         )
         response.raise_for_status()
         data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return normalize_llm_reply_content(data["choices"][0]["message"].get("content", ""))
     except Exception as e:
         return (
             "本地 LLM 调用失败：\n"
@@ -717,7 +769,7 @@ with gr.Blocks(title="My Local Voice ChatGPT") as demo:
 
             tts_provider = gr.Radio(
                 choices=["edge-tts", "pyttsx3", "OpenAI TTS API"],
-                value="OpenAI TTS API",
+                value="pyttsx3",
                 label="TTS 朗读方式",
                 info="edge-tts 需要联网；pyttsx3 更接近完全本地；OpenAI TTS API 需要 OpenAI Key。",
             )
