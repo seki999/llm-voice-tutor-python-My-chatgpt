@@ -1,1 +1,29 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local secrets
 openai_api_key.txt
+.env
+
+# Local app data
+my_chatgpt_preset.json
+chat_history.txt
+
+# Temporary files
+*.tmp
+*.wav
+*.mp3
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
