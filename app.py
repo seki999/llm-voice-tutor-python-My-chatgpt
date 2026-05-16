@@ -137,54 +137,123 @@ TEMP_AUDIO_FILES: List[str] = []
 
 def normalize_llm_reply_content(content) -> str:
     """
-    Some OpenAI-compatible APIs return content as:
+    OpenAI-compatible APIs / Local LM Studio / Ollama / llama.cpp sometimes return content as:
+      "plain text"
       [{"text": "...", "type": "text"}]
-    instead of a plain string.
+      "[{'text': '...', 'type': 'text'}]"
+      "[{'text': '[{\\'text\\': \\'...\\', \\'type\\': \\'text\\'}]', 'type': 'text'}]"
 
-    This function extracts only the human-readable text so the UI and TTS
-    will not display/read extra symbols like [{'text': ..., 'type': 'text'}].
+    This function recursively extracts only the human-readable text.
+    It also handles nested stringified list/dict content and removes unwanted wrapper symbols.
     """
-    if content is None:
-        return ""
+    import ast
+    import html
 
-    if isinstance(content, str):
-        raw = content.strip()
+    def _try_parse_string(value: str):
+        raw = value.strip()
 
-        # Sometimes the API/client converts list content into a string like:
-        # "[{'text': 'hello', 'type': 'text'}]"
-        # Try to safely parse it and extract text.
-        if raw.startswith("[") and raw.endswith("]") and "'text'" in raw:
+        if not raw:
+            return ""
+
+        # Clean HTML entities just in case.
+        raw = html.unescape(raw)
+
+        # Convert escaped newlines into real newlines when they appear as text.
+        raw = raw.replace("\\n", "\n")
+
+        # Some APIs return Python-like list/dict strings with single quotes.
+        looks_like_container = (
+            (raw.startswith("[") and raw.endswith("]")) or
+            (raw.startswith("{") and raw.endswith("}"))
+        )
+
+        if looks_like_container:
             try:
-                import ast
-                parsed = ast.literal_eval(raw)
-                return normalize_llm_reply_content(parsed)
+                return ast.literal_eval(raw)
             except Exception:
-                return raw
+                pass
 
         return raw
 
-    if isinstance(content, list):
-        parts = []
+    def _extract(value, depth: int = 0) -> str:
+        # Prevent infinite recursion caused by unexpected API response formats.
+        if depth > 15:
+            return str(value).strip()
 
-        for item in content:
-            if isinstance(item, dict):
-                if "text" in item:
-                    parts.append(str(item.get("text", "")))
-                elif "content" in item:
-                    parts.append(str(item.get("content", "")))
-            else:
-                parts.append(str(item))
+        if value is None:
+            return ""
 
-        return "\n".join([p.strip() for p in parts if p and p.strip()]).strip()
+        if isinstance(value, str):
+            parsed = _try_parse_string(value)
 
-    if isinstance(content, dict):
-        if "text" in content:
-            return str(content.get("text", "")).strip()
-        if "content" in content:
-            return normalize_llm_reply_content(content.get("content"))
-        return str(content).strip()
+            # If parsing produced list/dict, continue extracting.
+            if not isinstance(parsed, str):
+                return _extract(parsed, depth + 1)
 
-    return str(content).strip()
+            stripped = parsed.strip()
+
+            # Sometimes after first cleanup it still becomes a stringified container.
+            if (
+                (stripped.startswith("[") and stripped.endswith("]")) or
+                (stripped.startswith("{") and stripped.endswith("}"))
+            ):
+                try:
+                    reparsed = ast.literal_eval(stripped)
+                    return _extract(reparsed, depth + 1)
+                except Exception:
+                    return stripped
+
+            return stripped
+
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                extracted = _extract(item, depth + 1)
+                if extracted:
+                    parts.append(extracted)
+            return "\n".join(parts).strip()
+
+        if isinstance(value, dict):
+            # Most common OpenAI-compatible content block format.
+            if "text" in value:
+                return _extract(value.get("text"), depth + 1)
+
+            if "content" in value:
+                return _extract(value.get("content"), depth + 1)
+
+            # Fallback: extract readable values only, ignoring metadata-like keys.
+            ignored_keys = {"type", "role", "index", "finish_reason"}
+            parts = []
+            for key, val in value.items():
+                if key in ignored_keys:
+                    continue
+                extracted = _extract(val, depth + 1)
+                if extracted:
+                    parts.append(extracted)
+            return "\n".join(parts).strip()
+
+        return str(value).strip()
+
+    result = _extract(content)
+
+    # Final visible cleanup.
+    result = result.replace("\\'", "'")
+    result = result.replace('\\"', '"')
+    result = result.replace("\\n", "\n")
+
+    # Remove excessive blank lines.
+    lines = [line.rstrip() for line in result.splitlines()]
+    cleaned_lines = []
+    previous_blank = False
+
+    for line in lines:
+        is_blank = not line.strip()
+        if is_blank and previous_blank:
+            continue
+        cleaned_lines.append(line)
+        previous_blank = is_blank
+
+    return "\n".join(cleaned_lines).strip()
 
 def load_openai_api_key() -> str:
     env_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -255,7 +324,7 @@ def call_openai(system_prompt: str, user_message: str, history: List[Dict[str, s
             temperature=float(temperature),
             max_tokens=int(max_tokens),
         )
-        return (response.choices[0].message.content or "").strip()
+        return normalize_llm_reply_content(response.choices[0].message.content)
     except Exception as e:
         return f"OpenAI API 调用失败：{e}"
 
