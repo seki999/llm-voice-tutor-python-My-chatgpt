@@ -289,7 +289,10 @@ def normalize_messages(chatbot_history: List[Dict[str, str]]) -> List[Dict[str, 
         role = item.get("role")
         content = item.get("content", "")
         if role in ("user", "assistant") and str(content).strip():
-            messages.append({"role": role, "content": str(content)})
+            # user / assistant both may be wrapped by OpenAI-compatible JSON blocks.
+            # Clean both before sending history back to LLM.
+            content = normalize_llm_reply_content(content)
+            messages.append({"role": role, "content": content})
     return messages
 
 
@@ -656,15 +659,55 @@ def synthesize_tts_file(tts_provider: str, text: str, cleanup_before: bool = Tru
     return create_edge_tts_file(text, language=lang, cleanup_before=cleanup_before)
 
 
+def clean_chatbot_history_for_display(chatbot_history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Gradio Chatbot 显示前的最后一道保险。
+
+    即使某些 OpenAI-compatible API 把 user / assistant content 返回成
+    [{'text': '...', 'type': 'text'}] 或多层嵌套字符串，
+    这里也会在写入/返回 Chatbot 之前再次清理，确保
+    「② 用户输入 / 对话」里面显示的是干净文本。
+    """
+    cleaned = []
+
+    for item in chatbot_history or []:
+        if not isinstance(item, dict):
+            continue
+
+        role = item.get("role")
+        content = item.get("content", "")
+
+        if role not in ("user", "assistant"):
+            continue
+
+        # user 输入也可能被包装成 [{'text': '...', 'type': 'text'}]，所以两边都清理。
+        content = normalize_llm_reply_content(content)
+
+        if content:
+            cleaned.append({"role": role, "content": content})
+
+    return cleaned
+
+
 # ============================================================
 # Gradio event functions
 # ============================================================
 def append_chat_history(chatbot_history: List[Dict[str, str]], user_message: str, assistant_reply: str) -> List[Dict[str, str]]:
     chatbot_history = chatbot_history or []
-    chatbot_history = normalize_messages(chatbot_history)
-    chatbot_history.append({"role": "user", "content": user_message})
-    chatbot_history.append({"role": "assistant", "content": assistant_reply})
-    return chatbot_history
+
+    # 先把已有历史也清理一遍，避免之前残留的原始 JSON 一直显示在 Chatbot 中。
+    chatbot_history = clean_chatbot_history_for_display(normalize_messages(chatbot_history))
+
+    clean_user_message = normalize_llm_reply_content(user_message)
+    clean_assistant_reply = normalize_llm_reply_content(assistant_reply)
+
+    if clean_user_message:
+        chatbot_history.append({"role": "user", "content": clean_user_message})
+    if clean_assistant_reply:
+        chatbot_history.append({"role": "assistant", "content": clean_assistant_reply})
+
+    # 返回给 Gradio Chatbot 前再清理一次，确保「② 用户输入 / 对话」只显示干净文本。
+    return clean_chatbot_history_for_display(chatbot_history)
 
 
 def text_chat_once(
@@ -676,17 +719,21 @@ def text_chat_once(
     temperature: float,
     max_tokens: int,
 ):
-    user_message = (user_message or "").strip()
+    # 用户输入本身也可能是 OpenAI-compatible JSON block 的字符串形式，先清理再显示/发送。
+    user_message = normalize_llm_reply_content(user_message)
     chatbot_history = chatbot_history or []
 
     if not user_message:
-        return chatbot_history, "", None, get_teacher_idle_path(), ""
+        return clean_chatbot_history_for_display(chatbot_history), "", None, get_teacher_idle_path(), ""
 
-    reply = call_llm(provider, system_prompt, user_message, chatbot_history, temperature, max_tokens)
+    raw_reply = call_llm(provider, system_prompt, user_message, chatbot_history, temperature, max_tokens)
+    reply = normalize_llm_reply_content(raw_reply)
+
+    # TTS 和 Chatbot 都使用过滤后的文本，避免朗读/显示 API 原始 JSON。
     audio_reply = synthesize_tts_file(tts_provider, reply, cleanup_before=True)
     new_history = append_chat_history(chatbot_history, user_message, reply)
 
-    return new_history, "", audio_reply, get_teacher_speaking_path(), user_message
+    return clean_chatbot_history_for_display(new_history), "", audio_reply, get_teacher_speaking_path(), user_message
 
 
 def voice_chat_once(
@@ -709,7 +756,7 @@ def voice_chat_once(
             get_teacher_idle_path(),
         )
 
-    transcript = transcribe_audio(audio_path)
+    transcript = normalize_llm_reply_content(transcribe_audio(audio_path))
 
     if not transcript:
         return (
@@ -720,15 +767,18 @@ def voice_chat_once(
             get_teacher_idle_path(),
         )
 
-    reply = call_llm(provider, system_prompt, transcript, chatbot_history, temperature, max_tokens)
+    raw_reply = call_llm(provider, system_prompt, transcript, chatbot_history, temperature, max_tokens)
+    reply = normalize_llm_reply_content(raw_reply)
+
+    # TTS 和 Chatbot 都使用过滤后的文本，避免朗读/显示 API 原始 JSON。
     audio_reply = synthesize_tts_file(tts_provider, reply, cleanup_before=True)
     new_history = append_chat_history(chatbot_history, transcript, reply)
 
-    return new_history, transcript, audio_reply, gr.update(value=None), get_teacher_speaking_path()
+    return clean_chatbot_history_for_display(new_history), transcript, audio_reply, gr.update(value=None), get_teacher_speaking_path()
 
 
 def clear_chat() -> List[Dict[str, str]]:
-    return [{"role": "assistant", "content": DEFAULT_FIRST_MESSAGE}]
+    return clean_chatbot_history_for_display([{"role": "assistant", "content": DEFAULT_FIRST_MESSAGE}])
 
 
 def save_my_chatgpt(system_prompt: str) -> str:
@@ -759,7 +809,7 @@ def load_my_chatgpt() -> Tuple[str, str]:
 
 
 def export_chat(chatbot_history: List[Dict[str, str]]) -> str:
-    chatbot_history = normalize_messages(chatbot_history or [])
+    chatbot_history = clean_chatbot_history_for_display(normalize_messages(chatbot_history or []))
     lines = []
 
     for item in chatbot_history:
