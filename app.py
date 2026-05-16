@@ -2,7 +2,9 @@ import atexit
 import asyncio
 import json
 import os
+import re
 import tempfile
+import wave
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -488,45 +490,116 @@ def clean_tts_text(text: str) -> str:
     return text.strip()
 
 
-def select_voice(engine: pyttsx3.Engine, language: str) -> None:
+def find_voice_by_keywords(voices, keyword_groups):
+    """
+    keyword_groups example:
+      [["chinese", "zh-cn"], ["kangkang", "yunxi"]]
+    A voice matches one group when it contains any keyword in that group.
+    It must match every group.
+    """
+    for voice in voices:
+        combined = f"{voice.name or ''} {voice.id or ''}".lower()
+        matched_all_groups = True
+
+        for group in keyword_groups:
+            if group and not any(keyword in combined for keyword in group):
+                matched_all_groups = False
+                break
+
+        if matched_all_groups:
+            return voice
+
+    return None
+
+
+def select_voice(engine: pyttsx3.Engine, language: str, gender: str = "auto") -> None:
+    """
+    Select pyttsx3 system voice.
+
+    gender:
+      - "male"   : prefer male voice
+      - "female" : prefer female voice
+      - "auto"   : choose a reasonable default
+
+    注意：pyttsx3 调用的是系统已安装的 voice。
+    如果 Windows/macOS 没有中文男声或中文女声，会自动 fallback 到可用中文 voice 或默认 voice。
+    """
     voices = engine.getProperty("voices")
     language = language.lower().strip()
+    gender = (gender or "auto").lower().strip()
+
+    chinese_keywords = [
+        "chinese", "mandarin", "zh-cn", "zh_", "zh-",
+        "huihui", "yaoyao", "xiaoxiao", "xiaoyi", "xiaobei", "kangkang",
+        "yunjian", "yunxi", "yunyang", "yunhao",
+    ]
+    chinese_male_keywords = [
+        "kangkang", "yunjian", "yunxi", "yunyang", "yunhao",
+        "male", "男", "nan",
+    ]
+    chinese_female_keywords = [
+        "huihui", "yaoyao", "xiaoxiao", "xiaoyi", "xiaobei",
+        "female", "女", "nv",
+    ]
+
+    english_keywords = ["english", "en-us", "en-gb", "en_", "en-"]
+    english_male_keywords = ["david", "mark", "george", "guy", "male"]
+    english_female_keywords = ["zira", "aria", "jenny", "sonia", "hazel", "susan", "heather", "samantha", "female"]
 
     if language == "zh":
-        preferred_keywords = [
-            "huihui", "yaoyao", "xiaoxiao", "xiaoyi", "xiaobei",
-            "kangkang", "chinese", "mandarin", "zh-cn", "zh_",
-        ]
-        for voice in voices:
-            combined = f"{voice.name or ''} {voice.id or ''}".lower()
-            if any(keyword in combined for keyword in preferred_keywords):
+        if gender == "male":
+            voice = find_voice_by_keywords(voices, [chinese_keywords, chinese_male_keywords])
+            if voice:
                 engine.setProperty("voice", voice.id)
-                print("[TTS] Selected Chinese voice:", voice.name)
+                print("[TTS] Selected Chinese male voice:", voice.name)
                 return
+
+        if gender == "female":
+            voice = find_voice_by_keywords(voices, [chinese_keywords, chinese_female_keywords])
+            if voice:
+                engine.setProperty("voice", voice.id)
+                print("[TTS] Selected Chinese female voice:", voice.name)
+                return
+
+        voice = find_voice_by_keywords(voices, [chinese_keywords])
+        if voice:
+            engine.setProperty("voice", voice.id)
+            print("[TTS] Selected Chinese voice:", voice.name)
+            return
+
         print("[TTS] No Chinese voice found. Using default voice.")
         return
 
-    female_keywords = ["zira", "aria", "jenny", "sonia", "hazel", "susan", "heather", "samantha", "female"]
-    english_keywords = ["english", "en-us", "en-gb", "en_", "en-"]
+    if gender == "male":
+        voice = find_voice_by_keywords(voices, [english_keywords, english_male_keywords])
+        if voice:
+            engine.setProperty("voice", voice.id)
+            print("[TTS] Selected male English voice:", voice.name)
+            return
 
-    for voice in voices:
-        combined = f"{voice.name or ''} {voice.id or ''}".lower()
-        if any(k in combined for k in female_keywords) and any(k in combined for k in english_keywords):
+    if gender == "female" or gender == "auto":
+        voice = find_voice_by_keywords(voices, [english_keywords, english_female_keywords])
+        if voice:
             engine.setProperty("voice", voice.id)
             print("[TTS] Selected female English voice:", voice.name)
             return
 
-    for voice in voices:
-        combined = f"{voice.name or ''} {voice.id or ''}".lower()
-        if any(k in combined for k in english_keywords):
-            engine.setProperty("voice", voice.id)
-            print("[TTS] Selected English voice:", voice.name)
-            return
+    voice = find_voice_by_keywords(voices, [english_keywords])
+    if voice:
+        engine.setProperty("voice", voice.id)
+        print("[TTS] Selected English voice:", voice.name)
+        return
 
-    print("[TTS] No English voice found. Using default voice.")
+    print("[TTS] No matching voice found. Using default voice.")
 
 
-def create_pyttsx3_file(text: str, language: str = "en", cleanup_before: bool = True) -> Optional[str]:
+def create_pyttsx3_file(
+    text: str,
+    language: str = "en",
+    cleanup_before: bool = True,
+    gender: str = "auto",
+    register_temp: bool = True,
+) -> Optional[str]:
     global TEMP_AUDIO_FILES
 
     text = clean_tts_text(text)
@@ -542,13 +615,15 @@ def create_pyttsx3_file(text: str, language: str = "en", cleanup_before: bool = 
         engine = pyttsx3.init()
         engine.setProperty("rate", 165 if language == "en" else 175)
         engine.setProperty("volume", 1.0)
-        select_voice(engine, language)
+        select_voice(engine, language, gender=gender)
         engine.save_to_file(text, output_path)
         engine.runAndWait()
         engine.stop()
 
-        TEMP_AUDIO_FILES.append(output_path)
-        print("[pyttsx3] Saved audio:", output_path)
+        if register_temp:
+            TEMP_AUDIO_FILES.append(output_path)
+
+        print(f"[pyttsx3] Saved audio ({language}, {gender}):", output_path)
         return output_path
     except Exception as e:
         print("[pyttsx3] Error:", e)
@@ -558,6 +633,184 @@ def create_pyttsx3_file(text: str, language: str = "en", cleanup_before: bool = 
         except Exception:
             pass
         return None
+
+
+def split_speaker_dialogue(text: str) -> List[Tuple[str, str, str]]:
+    """
+    Split dialogue like:
+      Speaker 1: 你好，我是主持人。
+      Speaker 2: 大家好，我来解释。
+
+    Returns tuples: (speaker_label, speech_text, gender)
+      Speaker 1 -> Chinese female voice
+      Speaker 2 -> Chinese male voice
+
+    Non-speaker continuation lines are attached to the previous speaker.
+    """
+    lines = (text or "").splitlines()
+    segments: List[Tuple[str, List[str], str]] = []
+    current_index: Optional[int] = None
+
+    for line in lines:
+        raw_line = line.rstrip()
+        match = re.match(r"^\s*Speaker\s*([12])\s*[:：]\s*(.*)$", raw_line, flags=re.IGNORECASE)
+
+        if match:
+            speaker_no = match.group(1)
+            # Only keep the actual speech for TTS.
+            # The visible chatbot text still keeps "Speaker 1:" / "Speaker 2:".
+            speech = match.group(2).strip()
+            speaker_label = f"Speaker {speaker_no}"
+            gender = "female" if speaker_no == "1" else "male"
+            segments.append((speaker_label, [speech] if speech else [], gender))
+            current_index = len(segments) - 1
+            continue
+
+        # Blank lines create a small visual/logical pause, but avoid standalone empty audio.
+        if not raw_line.strip():
+            if current_index is not None:
+                segments[current_index][1].append("")
+            continue
+
+        if current_index is not None:
+            segments[current_index][1].append(raw_line.strip())
+        else:
+            # Text before the first Speaker marker uses auto voice.
+            segments.append(("Narrator", [raw_line.strip()], "auto"))
+            current_index = len(segments) - 1
+
+    cleaned: List[Tuple[str, str, str]] = []
+    for speaker_label, part_lines, gender in segments:
+        speech_text = "\n".join(part_lines).strip()
+        if speech_text:
+            cleaned.append((speaker_label, speech_text, gender))
+
+    return cleaned
+
+
+def contains_speaker_dialogue(text: str) -> bool:
+    return bool(re.search(r"(?im)^\s*Speaker\s*[12]\s*[:：]", text or ""))
+
+
+def remove_speaker_labels_for_tts(text: str) -> str:
+    """
+    Remove only the spoken labels from TTS text.
+
+    Display keeps:
+      Speaker 1: 你好
+      Speaker 2: 你好
+
+    TTS reads only:
+      你好
+      你好
+    """
+    cleaned_lines = []
+    for line in (text or "").splitlines():
+        cleaned_line = re.sub(
+            r"^\s*Speaker\s*[12]\s*[:：]\s*",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned_lines.append(cleaned_line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
+def concat_wav_files(wav_paths: List[str], output_path: str) -> bool:
+    """Concatenate pyttsx3-generated WAV files using Python standard library."""
+    if not wav_paths:
+        return False
+
+    try:
+        with wave.open(wav_paths[0], "rb") as first:
+            params = first.getparams()
+
+        with wave.open(output_path, "wb") as output:
+            output.setparams(params)
+            for wav_path in wav_paths:
+                with wave.open(wav_path, "rb") as wav_file:
+                    if wav_file.getparams() != params:
+                        print("[pyttsx3 Speaker] WAV params differ. Cannot concatenate safely:", wav_path)
+                        return False
+                    output.writeframes(wav_file.readframes(wav_file.getnframes()))
+
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 1024
+    except Exception as e:
+        print("[pyttsx3 Speaker] WAV concat error:", e)
+        return False
+
+
+def create_pyttsx3_speaker_dialogue_file(text: str, cleanup_before: bool = True) -> Optional[str]:
+    """
+    Speaker dialogue mode for pyttsx3:
+      Speaker 1: -> Chinese female voice
+      Speaker 2: -> Chinese male voice
+
+    It generates each speaker line as a separate WAV and then concatenates them.
+    If anything fails, fallback to normal pyttsx3 reading.
+    """
+    global TEMP_AUDIO_FILES
+
+    text = clean_tts_text(text)
+    if not text:
+        return None
+
+    if cleanup_before:
+        cleanup_temp_audio_files()
+
+    segments = split_speaker_dialogue(text)
+    if not segments:
+        speech_only_text = remove_speaker_labels_for_tts(text)
+        return create_pyttsx3_file(
+            speech_only_text,
+            language="zh" if contains_cjk(speech_only_text) else "en",
+            cleanup_before=False,
+        )
+
+    segment_paths: List[str] = []
+    output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+
+    try:
+        for speaker_label, speech_text, gender in segments:
+            # 根据你的要求：Speaker 1/2 都按中文声音选择。
+            # 即使内容里有英文，pyttsx3 也会使用对应的中文男/女 voice 去读。
+            print(f"[pyttsx3 Speaker] {speaker_label} -> Chinese {gender} voice")
+            segment_path = create_pyttsx3_file(
+                speech_text,
+                language="zh",
+                cleanup_before=False,
+                gender=gender,
+                register_temp=False,
+            )
+            if segment_path:
+                segment_paths.append(segment_path)
+
+        if segment_paths and concat_wav_files(segment_paths, output_path):
+            TEMP_AUDIO_FILES.append(output_path)
+            print("[pyttsx3 Speaker] Saved merged dialogue audio:", output_path)
+            return output_path
+
+        print("[pyttsx3 Speaker] Merge failed. Falling back to normal pyttsx3.")
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except Exception:
+            pass
+        speech_only_text = remove_speaker_labels_for_tts(text)
+        return create_pyttsx3_file(
+            speech_only_text,
+            language="zh" if contains_cjk(speech_only_text) else "en",
+            cleanup_before=False,
+        )
+
+    finally:
+        for path in segment_paths:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                print("[pyttsx3 Speaker] Failed to delete segment audio:", path, e)
 
 
 async def edge_tts_save_async(text: str, output_path: str, voice: str) -> None:
@@ -654,6 +907,11 @@ def synthesize_tts_file(tts_provider: str, text: str, cleanup_before: bool = Tru
         return create_openai_tts_file(text, language=lang, cleanup_before=cleanup_before)
 
     if tts_provider == "pyttsx3":
+        # 双人对谈朗读模式：
+        # Speaker 1: -> pyttsx3 中文女声
+        # Speaker 2: -> pyttsx3 中文男声
+        if contains_speaker_dialogue(text):
+            return create_pyttsx3_speaker_dialogue_file(text, cleanup_before=cleanup_before)
         return create_pyttsx3_file(text, language=lang, cleanup_before=cleanup_before)
 
     return create_edge_tts_file(text, language=lang, cleanup_before=cleanup_before)
