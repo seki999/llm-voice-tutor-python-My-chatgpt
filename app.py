@@ -424,16 +424,28 @@ whisper_model = WhisperModel(
 )
 
 
-def transcribe_audio(audio_path: Optional[str]) -> str:
+WHISPER_LANGUAGE_MAP = {
+    "English": "en",
+    "Japanese": "ja",
+    "Chinese": "zh",
+    "Auto Detect": None,
+}
+
+
+def transcribe_audio(audio_path: Optional[str], whisper_language: str = "English") -> str:
     if not audio_path:
         print("[Whisper] No audio_path received")
         return ""
 
     print("[Whisper] Transcribing audio:", audio_path)
+    print("[Whisper] Selected language:", whisper_language)
 
     try:
+        language_code = WHISPER_LANGUAGE_MAP.get(whisper_language, "en")
+
         segments, info = whisper_model.transcribe(
             audio_path,
+            language=language_code,
             initial_prompt="The speech may be Chinese, English, or Japanese.",
             vad_filter=False,
             beam_size=5,
@@ -998,6 +1010,7 @@ def voice_chat_once(
     provider: str,
     tts_provider: str,
     system_prompt: str,
+    whisper_language: str,
     audio_path: Optional[str],
     chatbot_history: List[Dict[str, str]],
     temperature: float,
@@ -1014,7 +1027,7 @@ def voice_chat_once(
             get_teacher_idle_path(),
         )
 
-    transcript = normalize_llm_reply_content(transcribe_audio(audio_path))
+    transcript = normalize_llm_reply_content(transcribe_audio(audio_path, whisper_language))
 
     if not transcript:
         return (
@@ -1149,6 +1162,13 @@ with gr.Blocks(title="My Local Voice ChatGPT") as demo:
                 value="pyttsx3",
                 label="TTS 朗读方式",
                 info="edge-tts 需要联网；pyttsx3 更接近完全本地；OpenAI TTS API 需要 OpenAI Key。",
+            )
+
+            whisper_language = gr.Radio(
+                choices=["English", "Japanese", "Chinese", "Auto Detect"],
+                value="English",
+                label="Whisper 语音识别语言",
+                info="默认英语；如果要说日语或中文，请在这里切换。混合语言时可选 Auto Detect。",
             )
 
             system_prompt = gr.Textbox(
@@ -1322,7 +1342,7 @@ PowerShell 修改例子：
     try:
         audio_input.stop_recording(
             fn=voice_chat_once,
-            inputs=[provider, tts_provider, system_prompt, audio_input, chatbot, temperature, max_tokens],
+            inputs=[provider, tts_provider, system_prompt, whisper_language, audio_input, chatbot, temperature, max_tokens],
             outputs=_voice_outputs,
         )
     except Exception as e:
@@ -1330,7 +1350,7 @@ PowerShell 修改例子：
         try:
             audio_input.change(
                 fn=voice_chat_once,
-                inputs=[provider, tts_provider, system_prompt, audio_input, chatbot, temperature, max_tokens],
+                inputs=[provider, tts_provider, system_prompt, whisper_language, audio_input, chatbot, temperature, max_tokens],
                 outputs=_voice_outputs,
             )
         except Exception as change_error:
