@@ -42,6 +42,7 @@ OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "nova")
 EDGE_TTS_EN_VOICE = os.getenv("EDGE_TTS_EN_VOICE", "en-US-JennyNeural")
 EDGE_TTS_ZH_VOICE = os.getenv("EDGE_TTS_ZH_VOICE", "zh-CN-XiaoxiaoNeural")
+EDGE_TTS_JA_VOICE = os.getenv("EDGE_TTS_JA_VOICE", "ja-JP-NanamiNeural")
 
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
@@ -494,6 +495,39 @@ def contains_cjk(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in text or "")
 
 
+def contains_japanese_kana(text: str) -> bool:
+    return any(
+        ("\u3040" <= ch <= "\u309f") or ("\u30a0" <= ch <= "\u30ff")
+        for ch in text or ""
+    )
+
+
+def resolve_tts_language(text: str, whisper_language: str = "Auto Detect") -> str:
+    """
+    Convert the UI language selection to the language used by TTS.
+
+    Important:
+    - If Whisper language is Japanese, TTS is forced to Japanese.
+    - If Whisper language is Chinese, TTS is forced to Chinese.
+    - If Whisper language is English, TTS is forced to English.
+    - Auto Detect keeps the old behavior, but now it can also detect Japanese kana.
+    """
+    whisper_language = (whisper_language or "Auto Detect").strip()
+
+    if whisper_language == "Japanese":
+        return "ja"
+    if whisper_language == "Chinese":
+        return "zh"
+    if whisper_language == "English":
+        return "en"
+
+    if contains_japanese_kana(text):
+        return "ja"
+    if contains_cjk(text):
+        return "zh"
+    return "en"
+
+
 def clean_tts_text(text: str) -> str:
     text = text or ""
     # 让朗读更自然一点，避免读出太多 markdown 符号
@@ -528,13 +562,18 @@ def select_voice(engine: pyttsx3.Engine, language: str, gender: str = "auto") ->
     """
     Select pyttsx3 system voice.
 
+    language:
+      - "en": English
+      - "zh": Chinese
+      - "ja": Japanese
+
     gender:
       - "male"   : prefer male voice
       - "female" : prefer female voice
       - "auto"   : choose a reasonable default
 
     注意：pyttsx3 调用的是系统已安装的 voice。
-    如果 Windows/macOS 没有中文男声或中文女声，会自动 fallback 到可用中文 voice 或默认 voice。
+    如果 Windows/macOS 没有指定语言/性别的 voice，会自动 fallback 到可用 voice 或默认 voice。
     """
     voices = engine.getProperty("voices")
     language = language.lower().strip()
@@ -553,6 +592,14 @@ def select_voice(engine: pyttsx3.Engine, language: str, gender: str = "auto") ->
         "huihui", "yaoyao", "xiaoxiao", "xiaoyi", "xiaobei",
         "female", "女", "nv",
     ]
+
+    japanese_keywords = [
+        "japanese", "ja-jp", "ja_jp", "ja-", "ja_",
+        "haruka", "ayumi", "ichiro", "nanami", "keita", "aoi", "shiori",
+        "sayaka", "mayumi", "日本", "日本語",
+    ]
+    japanese_male_keywords = ["ichiro", "keita", "male", "男"]
+    japanese_female_keywords = ["haruka", "ayumi", "nanami", "aoi", "shiori", "sayaka", "mayumi", "female", "女"]
 
     english_keywords = ["english", "en-us", "en-gb", "en_", "en-"]
     english_male_keywords = ["david", "mark", "george", "guy", "male"]
@@ -582,6 +629,30 @@ def select_voice(engine: pyttsx3.Engine, language: str, gender: str = "auto") ->
         print("[TTS] No Chinese voice found. Using default voice.")
         return
 
+    if language == "ja":
+        if gender == "male":
+            voice = find_voice_by_keywords(voices, [japanese_keywords, japanese_male_keywords])
+            if voice:
+                engine.setProperty("voice", voice.id)
+                print("[TTS] Selected Japanese male voice:", voice.name)
+                return
+
+        if gender == "female" or gender == "auto":
+            voice = find_voice_by_keywords(voices, [japanese_keywords, japanese_female_keywords])
+            if voice:
+                engine.setProperty("voice", voice.id)
+                print("[TTS] Selected Japanese female voice:", voice.name)
+                return
+
+        voice = find_voice_by_keywords(voices, [japanese_keywords])
+        if voice:
+            engine.setProperty("voice", voice.id)
+            print("[TTS] Selected Japanese voice:", voice.name)
+            return
+
+        print("[TTS] No Japanese voice found. Using default voice.")
+        return
+
     if gender == "male":
         voice = find_voice_by_keywords(voices, [english_keywords, english_male_keywords])
         if voice:
@@ -604,7 +675,6 @@ def select_voice(engine: pyttsx3.Engine, language: str, gender: str = "auto") ->
 
     print("[TTS] No matching voice found. Using default voice.")
 
-
 def create_pyttsx3_file(
     text: str,
     language: str = "en",
@@ -625,7 +695,7 @@ def create_pyttsx3_file(
 
     try:
         engine = pyttsx3.init()
-        engine.setProperty("rate", 165 if language == "en" else 175)
+        engine.setProperty("rate", 165 if language == "en" else 175)  # Japanese / Chinese usually sound better slightly faster.
         engine.setProperty("volume", 1.0)
         select_voice(engine, language, gender=gender)
         engine.save_to_file(text, output_path)
@@ -841,9 +911,16 @@ def create_edge_tts_file(text: str, language: str = "en", cleanup_before: bool =
         cleanup_temp_audio_files()
 
     output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
-    voice = EDGE_TTS_ZH_VOICE if language == "zh" or contains_cjk(text) else EDGE_TTS_EN_VOICE
+
+    if language == "ja":
+        voice = EDGE_TTS_JA_VOICE
+    elif language == "zh" or contains_cjk(text):
+        voice = EDGE_TTS_ZH_VOICE
+    else:
+        voice = EDGE_TTS_EN_VOICE
 
     try:
+        print("[edge-tts] Language:", language)
         print("[edge-tts] Voice:", voice)
         asyncio.run(edge_tts_save_async(text, output_path, voice))
 
@@ -885,6 +962,7 @@ def create_openai_tts_file(text: str, language: str = "en", cleanup_before: bool
     try:
         print("[OpenAI TTS] Model:", OPENAI_TTS_MODEL)
         print("[OpenAI TTS] Voice:", OPENAI_TTS_VOICE)
+        print("[OpenAI TTS] Language hint:", language)
 
         with client.audio.speech.with_streaming_response.create(
             model=OPENAI_TTS_MODEL,
@@ -912,22 +990,37 @@ def create_openai_tts_file(text: str, language: str = "en", cleanup_before: bool
         return create_pyttsx3_file(text, language=language, cleanup_before=False)
 
 
-def synthesize_tts_file(tts_provider: str, text: str, cleanup_before: bool = True) -> Optional[str]:
-    lang = "zh" if contains_cjk(text) else "en"
+def synthesize_tts_file(
+    tts_provider: str,
+    text: str,
+    whisper_language: str = "Auto Detect",
+    cleanup_before: bool = True,
+) -> Optional[str]:
+    """
+    Create TTS audio according to the selected Whisper language.
+
+    Example:
+      Whisper 语音识别语言 = Japanese
+      -> edge-tts uses ja-JP-NanamiNeural
+      -> pyttsx3 tries to use a Japanese system voice
+      -> OpenAI TTS receives the same Japanese text and language hint in logs
+    """
+    lang = resolve_tts_language(text, whisper_language)
+    print("[TTS] Selected UI language:", whisper_language)
+    print("[TTS] Resolved TTS language:", lang)
 
     if tts_provider == "OpenAI TTS API":
         return create_openai_tts_file(text, language=lang, cleanup_before=cleanup_before)
 
     if tts_provider == "pyttsx3":
         # 双人对谈朗读模式：
-        # Speaker 1: -> pyttsx3 中文女声
-        # Speaker 2: -> pyttsx3 中文男声
-        if contains_speaker_dialogue(text):
+        # 原有规则保留：Speaker 1 -> 中文女声 / Speaker 2 -> 中文男声。
+        # 如果你选择了 Japanese，则优先整体使用日文 voice，避免中文 voice 读日文不自然。
+        if contains_speaker_dialogue(text) and lang != "ja":
             return create_pyttsx3_speaker_dialogue_file(text, cleanup_before=cleanup_before)
         return create_pyttsx3_file(text, language=lang, cleanup_before=cleanup_before)
 
     return create_edge_tts_file(text, language=lang, cleanup_before=cleanup_before)
-
 
 def clean_chatbot_history_for_display(chatbot_history: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
@@ -984,6 +1077,7 @@ def text_chat_once(
     provider: str,
     tts_provider: str,
     system_prompt: str,
+    whisper_language: str,
     user_message: str,
     chatbot_history: List[Dict[str, str]],
     temperature: float,
@@ -1000,7 +1094,7 @@ def text_chat_once(
     reply = normalize_llm_reply_content(raw_reply)
 
     # TTS 和 Chatbot 都使用过滤后的文本，避免朗读/显示 API 原始 JSON。
-    audio_reply = synthesize_tts_file(tts_provider, reply, cleanup_before=True)
+    audio_reply = synthesize_tts_file(tts_provider, reply, whisper_language=whisper_language, cleanup_before=True)
     new_history = append_chat_history(chatbot_history, user_message, reply)
 
     return clean_chatbot_history_for_display(new_history), "", audio_reply, get_teacher_speaking_path(), user_message
@@ -1042,7 +1136,7 @@ def voice_chat_once(
     reply = normalize_llm_reply_content(raw_reply)
 
     # TTS 和 Chatbot 都使用过滤后的文本，避免朗读/显示 API 原始 JSON。
-    audio_reply = synthesize_tts_file(tts_provider, reply, cleanup_before=True)
+    audio_reply = synthesize_tts_file(tts_provider, reply, whisper_language=whisper_language, cleanup_before=True)
     new_history = append_chat_history(chatbot_history, transcript, reply)
 
     return clean_chatbot_history_for_display(new_history), transcript, audio_reply, gr.update(value=None), get_teacher_speaking_path()
@@ -1062,6 +1156,7 @@ def save_my_chatgpt(system_prompt: str) -> str:
         "openai_tts_voice": OPENAI_TTS_VOICE,
         "edge_tts_en_voice": EDGE_TTS_EN_VOICE,
         "edge_tts_zh_voice": EDGE_TTS_ZH_VOICE,
+        "edge_tts_ja_voice": EDGE_TTS_JA_VOICE,
         "whisper_model": WHISPER_MODEL_NAME,
     }
     PRESET_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1206,6 +1301,8 @@ edge-tts 英文 Voice：`{EDGE_TTS_EN_VOICE}`
 
 edge-tts 中文 Voice：`{EDGE_TTS_ZH_VOICE}`
 
+edge-tts 日文 Voice：`{EDGE_TTS_JA_VOICE}`
+
 PowerShell 修改例子：
 
 `$env:LOCAL_LLM_MODEL="你的模型名"`
@@ -1213,6 +1310,8 @@ PowerShell 修改例子：
 `$env:WHISPER_MODEL_NAME="base"`
 
 `$env:EDGE_TTS_EN_VOICE="en-US-JennyNeural"`
+
+`$env:EDGE_TTS_JA_VOICE="ja-JP-NanamiNeural"`
 """
                 )
 
@@ -1288,13 +1387,13 @@ PowerShell 修改例子：
 
     send_btn.click(
         fn=text_chat_once,
-        inputs=[provider, tts_provider, system_prompt, user_input, chatbot, temperature, max_tokens],
+        inputs=[provider, tts_provider, system_prompt, whisper_language, user_input, chatbot, temperature, max_tokens],
         outputs=[chatbot, user_input, audio_reply_output, teacher_image, transcript_output],
     )
 
     user_input.submit(
         fn=text_chat_once,
-        inputs=[provider, tts_provider, system_prompt, user_input, chatbot, temperature, max_tokens],
+        inputs=[provider, tts_provider, system_prompt, whisper_language, user_input, chatbot, temperature, max_tokens],
         outputs=[chatbot, user_input, audio_reply_output, teacher_image, transcript_output],
     )
 
