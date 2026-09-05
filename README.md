@@ -2,6 +2,10 @@
 
 这是一个可以在本地运行的简易版 My ChatGPT。
 
+> 新增：不通过浏览器运行的 Mila 桌面语音老师。首次双击
+> `setup_desktop.bat`，以后双击 `run_desktop.bat`。详细说明请看
+> [DESKTOP_README.md](DESKTOP_README.md)。
+
 ## 功能
 
 - 左侧可以定义自己的 My ChatGPT，也就是 system prompt / 角色设定
