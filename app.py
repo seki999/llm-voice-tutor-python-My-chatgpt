@@ -2,11 +2,15 @@ import atexit
 import asyncio
 import json
 import os
+import queue
 import re
+import sys
 import tempfile
+import threading
+import time
 import wave
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import gradio as gr
 import pyttsx3
@@ -17,7 +21,7 @@ from openai import OpenAI
 
 
 # ============================================================
-# My Local Voice ChatGPT
+# My Local Voice ChatGPT - 低延迟版
 # ============================================================
 # 功能：
 # 1. 可以定义自己的 My ChatGPT：system prompt / 角色设定
@@ -27,6 +31,17 @@ from openai import OpenAI
 # 5. 支持老师头像：播放语音时 teacher_speaking.gif，停止/暂停时 teacher.gif
 # 6. 支持 OpenAI API / Local LM Studio
 # 7. 支持保存 / 读取设定，导出对话历史
+#
+# 低延迟优化（参考 llm-voice-tutor-python 项目 app.py / realtime_app.py 的思路）：
+# - 大模型逐 token 流式生成，页面文字实时刷新，不用等回答说完才看到文字。
+# - edge-tts / OpenAI TTS API 会把已经说完的整句提前合成语音，边生成边播放，
+#   服务端按上一段语音的真实时长排队播放，做到"上一句放完下一句紧接着播"。
+# - pyttsx3 因为要支持 Speaker 1/2 双人配音朗读，需要看到完整回复才能正确
+#   分配音色，所以 pyttsx3 仍然是文字流式显示、生成完整段文字后再合成一次、
+#   播放一次（不会像逐句拼接那样听起来像循环）。
+# - 新增"停止朗读/停止回答"按钮：用 Gradio 自带的 cancels 立刻打断正在跑的
+#   生成器，不用等它自己跑完；录音/发送新的一轮也会自动打断上一轮。
+# - Whisper 识别加了 VAD、beam_size=1 等速度优化。
 # ============================================================
 
 
@@ -44,6 +59,10 @@ EDGE_TTS_EN_VOICE = os.getenv("EDGE_TTS_EN_VOICE", "en-US-JennyNeural")
 EDGE_TTS_ZH_VOICE = os.getenv("EDGE_TTS_ZH_VOICE", "zh-CN-XiaoxiaoNeural")
 EDGE_TTS_JA_VOICE = os.getenv("EDGE_TTS_JA_VOICE", "ja-JP-NanamiNeural")
 
+# "small" 中英日识别都更稳，但在弱一点的 CPU 上一句话可能要 10 秒以上。
+# "base" 快 2~3 倍，但中文/日文经常会被识别成不相关的英文。
+# 如果你主要说英语，可以用环境变量切换成 base：
+#   $env:WHISPER_MODEL_NAME="base"
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -56,6 +75,18 @@ if os.name == "nt":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception as e:
         print("[edge-tts] Failed to set WindowsSelectorEventLoopPolicy:", e)
+
+
+# 低延迟流式对话会在后台线程里 print() 大模型返回的原始文字（中文、日语假名、
+# 国际音标等）。如果控制台不是 UTF-8（比如某些 Windows 终端默认用 GBK/cp1252），
+# 遇到打印不了的字符会直接抛 UnicodeEncodeError，把负责合成语音的后台线程整个
+# 杀死。这里把编码错误改成替换而不是抛异常，保证打印永远不会打断真正的业务逻辑。
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="backslashreplace")
+        except Exception:
+            pass
 
 
 DEFAULT_MY_CHATGPT = """你是我的 TOEIC 英语听力练习导师。
@@ -308,40 +339,83 @@ def remove_initial_greeting(messages: List[Dict[str, str]]) -> List[Dict[str, st
     return messages
 
 
-def call_openai(system_prompt: str, user_message: str, history: List[Dict[str, str]], temperature: float, max_tokens: int) -> str:
+def build_chat_messages(
+    system_prompt: str,
+    user_message: str,
+    history: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """
+    组装发给大模型的完整 messages（system + 历史 + 当前这一轮）。
+    阻塞调用和流式调用都用这一份，避免重复。
+    """
+    if not system_prompt.strip():
+        system_prompt = "You are a helpful assistant."
+
+    messages = [{"role": "system", "content": system_prompt.strip()}]
+    messages.extend(remove_initial_greeting(normalize_messages(history)))
+    messages.append({"role": "user", "content": user_message.strip()})
+    return messages
+
+
+# ============================================================
+# Streaming LLM calls (低延迟核心)
+# ============================================================
+def stream_openai_reply(
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    cancel_event: threading.Event,
+) -> Iterator[str]:
+    """逐 token 流式返回 OpenAI 回复。"""
     client = get_openai_client()
     if client is None:
-        return (
+        yield (
             "OpenAI API Key 没有设置。\n\n"
             "设置方法一：在 PowerShell 中执行：\n"
             '$env:OPENAI_API_KEY="sk-你的key"\n'
             "python app.py\n\n"
             "设置方法二：在 app.py 同目录创建 openai_api_key.txt，把 key 写进去。"
         )
+        return
 
-    messages = [{"role": "system", "content": system_prompt.strip()}]
-    messages.extend(remove_initial_greeting(normalize_messages(history)))
-    messages.append({"role": "user", "content": user_message.strip()})
+    print("[OpenAI] Streaming reply. Model:", OPENAI_MODEL)
 
     try:
-        response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
             temperature=float(temperature),
             max_tokens=int(max_tokens),
+            stream=True,
         )
-        return normalize_llm_reply_content(response.choices[0].message.content)
+        for chunk in stream:
+            if cancel_event.is_set():
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
+                return
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            token = getattr(delta, "content", None)
+            if isinstance(token, str) and token:
+                yield token
     except Exception as e:
-        return f"OpenAI API 调用失败：{e}"
+        print("[OpenAI] Streaming error:", e)
+        yield f"\nOpenAI API 调用失败：{e}"
 
 
-def call_local_llm(system_prompt: str, user_message: str, history: List[Dict[str, str]], temperature: float, max_tokens: int) -> str:
-    messages = [{"role": "system", "content": system_prompt.strip()}]
-    messages.extend(remove_initial_greeting(normalize_messages(history)))
-    messages.append({"role": "user", "content": user_message.strip()})
+def stream_local_llm_reply(
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    cancel_event: threading.Event,
+) -> Iterator[str]:
+    """逐 token 流式返回本地 LM Studio / Ollama 的回复。"""
+    print("[Local LLM] Streaming reply. URL:", LOCAL_LLM_URL, "Model:", LOCAL_LLM_MODEL)
 
     try:
-        response = requests.post(
+        with requests.post(
             LOCAL_LLM_URL,
             headers={"Content-Type": "application/json"},
             json={
@@ -349,16 +423,37 @@ def call_local_llm(system_prompt: str, user_message: str, history: List[Dict[str
                 "messages": messages,
                 "temperature": float(temperature),
                 "max_tokens": int(max_tokens),
-                "stream": False,
+                "stream": True,
             },
-            timeout=180,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return normalize_llm_reply_content(data["choices"][0]["message"].get("content", ""))
+            stream=True,
+            timeout=(10, 180),
+        ) as response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if cancel_event.is_set():
+                    return
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    return
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                token = delta.get("content")
+                if isinstance(token, str) and token:
+                    yield token
     except Exception as e:
-        return (
-            "本地 LLM 调用失败：\n"
+        print("[Local LLM] Streaming error:", e)
+        yield (
+            "\n本地 LLM 调用失败：\n"
             f"{e}\n\n"
             "请确认：\n"
             "1. LM Studio Server 已启动。\n"
@@ -368,14 +463,18 @@ def call_local_llm(system_prompt: str, user_message: str, history: List[Dict[str
         )
 
 
-def call_llm(provider: str, system_prompt: str, user_message: str, history: List[Dict[str, str]], temperature: float, max_tokens: int) -> str:
-    if not system_prompt.strip():
-        system_prompt = "You are a helpful assistant."
-
+def stream_llm_reply(
+    provider: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    cancel_event: threading.Event,
+) -> Iterator[str]:
+    """根据 UI 选择调用 OpenAI 或本地 LLM，逐 token 流式返回。"""
     if provider == "Local LM Studio":
-        return call_local_llm(system_prompt, user_message, history, temperature, max_tokens)
-
-    return call_openai(system_prompt, user_message, history, temperature, max_tokens)
+        yield from stream_local_llm_reply(messages, temperature, max_tokens, cancel_event)
+    else:
+        yield from stream_openai_reply(messages, temperature, max_tokens, cancel_event)
 
 
 # ============================================================
@@ -422,6 +521,8 @@ whisper_model = WhisperModel(
     WHISPER_MODEL_NAME,
     device=WHISPER_DEVICE,
     compute_type=WHISPER_COMPUTE_TYPE,
+    cpu_threads=max(1, min(8, (os.cpu_count() or 8) - 2)),
+    num_workers=1,
 )
 
 
@@ -448,8 +549,16 @@ def transcribe_audio(audio_path: Optional[str], whisper_language: str = "English
             audio_path,
             language=language_code,
             initial_prompt="The speech may be Chinese, English, or Japanese.",
-            vad_filter=False,
-            beam_size=5,
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 350,
+                "speech_pad_ms": 120,
+            },
+            without_timestamps=True,
+            condition_on_previous_text=False,
         )
 
         texts = []
@@ -492,12 +601,12 @@ atexit.register(cleanup_temp_audio_files)
 
 
 def contains_cjk(text: str) -> bool:
-    return any("\u4e00" <= ch <= "\u9fff" for ch in text or "")
+    return any("一" <= ch <= "鿿" for ch in text or "")
 
 
 def contains_japanese_kana(text: str) -> bool:
     return any(
-        ("\u3040" <= ch <= "\u309f") or ("\u30a0" <= ch <= "\u30ff")
+        ("぀" <= ch <= "ゟ") or ("゠" <= ch <= "ヿ")
         for ch in text or ""
     )
 
@@ -1022,6 +1131,36 @@ def synthesize_tts_file(
 
     return create_edge_tts_file(text, language=lang, cleanup_before=cleanup_before)
 
+
+def get_audio_duration_seconds(path: str) -> float:
+    """
+    估算一段语音的播放时长，让下一段语音在这一段播完之后再进入 Audio 组件，
+    避免新音频提前把上一句截断。
+    """
+    suffix = Path(path).suffix.lower()
+
+    try:
+        if suffix == ".wav":
+            with wave.open(path, "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate() or 1
+                return frames / float(rate)
+
+        from mutagen import File as MutagenFile
+
+        audio = MutagenFile(path)
+        if audio is not None and audio.info is not None:
+            return float(audio.info.length)
+    except Exception as e:
+        print("[Audio] Failed to read duration, estimating instead:", path, e)
+
+    try:
+        size_bytes = os.path.getsize(path)
+        return max(0.6, size_bytes / 16000.0)
+    except OSError:
+        return 1.5
+
+
 def clean_chatbot_history_for_display(chatbot_history: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     Gradio Chatbot 显示前的最后一道保险。
@@ -1053,8 +1192,352 @@ def clean_chatbot_history_for_display(chatbot_history: List[Dict[str, str]]) -> 
 
 
 # ============================================================
+# 低延迟流式引擎（参考 llm-voice-tutor-python 项目 app.py / realtime_app.py）
+# ============================================================
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?。！？；;])\s*")
+
+
+def pop_speakable_chunks(buffer: str, force: bool = False) -> Tuple[List[str], str]:
+    """从流式文字缓冲区里取出已经说完的完整分句，用于边生成边朗读。"""
+    chunks: List[str] = []
+
+    while True:
+        match = _SENTENCE_BOUNDARY_RE.search(buffer)
+        if not match:
+            break
+        candidate = buffer[: match.end()].strip()
+        buffer = buffer[match.end():]
+        if candidate:
+            chunks.append(candidate)
+
+    # 没有标点的长回答，也不要让语音无限期等待。
+    if len(buffer) >= 100:
+        cut = max(
+            buffer.rfind(",", 45, 100),
+            buffer.rfind("，", 45, 100),
+            buffer.rfind(" ", 60, 100),
+        )
+        if cut > 0:
+            chunks.append(buffer[: cut + 1].strip())
+            buffer = buffer[cut + 1:]
+
+    if force and buffer.strip():
+        chunks.append(buffer.strip())
+        buffer = ""
+
+    return chunks, buffer
+
+
+class ReplyUpdate(NamedTuple):
+    text: str
+    audio_path: Optional[str]
+    done: bool
+
+
+# 单机本地应用，用一个全局的取消令牌就够了：
+# 开始新一轮回答会自动打断上一轮还没播完的回答/语音。
+CURRENT_CANCEL_EVENT: Optional[threading.Event] = None
+CANCEL_EVENT_LOCK = threading.Lock()
+
+
+def start_new_turn() -> threading.Event:
+    """取消上一轮还在进行的回答/朗读，并为这一轮注册新的取消令牌。"""
+    global CURRENT_CANCEL_EVENT
+    with CANCEL_EVENT_LOCK:
+        if CURRENT_CANCEL_EVENT is not None:
+            CURRENT_CANCEL_EVENT.set()
+        new_event = threading.Event()
+        CURRENT_CANCEL_EVENT = new_event
+        return new_event
+
+
+def stop_current_turn() -> None:
+    with CANCEL_EVENT_LOCK:
+        if CURRENT_CANCEL_EVENT is not None:
+            CURRENT_CANCEL_EVENT.set()
+
+
+def stop_current_turn_ui():
+    """"停止朗读/停止回答"按钮：中断生成，并清空正在播放的音频。"""
+    stop_current_turn()
+    return gr.update(value=None), get_teacher_idle_path()
+
+
+def run_streaming_chat_reply(
+    *,
+    provider: str,
+    tts_provider: str,
+    messages: List[Dict[str, str]],
+    whisper_language: str,
+    temperature: float,
+    max_tokens: int,
+    cancel_event: threading.Event,
+) -> Iterator[ReplyUpdate]:
+    """
+    大模型逐 token 流式生成回复。
+
+    edge-tts / OpenAI TTS API：把已经说完的整句提前合成语音，边生成边播放，
+    每次有新文字或者轮到下一段语音播放时就 yield 一次 ReplyUpdate。
+
+    pyttsx3：因为要支持 Speaker 1/2 双人配音，需要看到完整回复才能正确分配
+    音色，所以这里只做文字流式显示，不在中途合成语音（audio_path 一直是
+    None），调用方在收到最后一条 done=True 的更新后再自己合成一次完整语音。
+    """
+    event_queue: "queue.Queue" = queue.Queue()
+    tts_queue: "queue.Queue" = queue.Queue()
+    stream_tts = tts_provider != "pyttsx3"
+
+    def llm_worker() -> None:
+        buffer = ""
+        try:
+            for token in stream_llm_reply(provider, messages, temperature, max_tokens, cancel_event):
+                if cancel_event.is_set():
+                    break
+                event_queue.put(("token", token))
+                if stream_tts:
+                    buffer += token
+                    chunks, buffer = pop_speakable_chunks(buffer, False)
+                    for chunk in chunks:
+                        tts_queue.put(chunk)
+            if not cancel_event.is_set() and stream_tts:
+                chunks, _ = pop_speakable_chunks(buffer, True)
+                for chunk in chunks:
+                    tts_queue.put(chunk)
+        finally:
+            tts_queue.put(None)
+            event_queue.put(("llm_done", None))
+
+    def tts_worker() -> None:
+        try:
+            while stream_tts and not cancel_event.is_set():
+                chunk = tts_queue.get()
+                if chunk is None:
+                    break
+                try:
+                    speak_text = clean_tts_text(chunk)
+                    if not speak_text:
+                        continue
+                    audio_path = synthesize_tts_file(
+                        tts_provider, speak_text, whisper_language=whisper_language, cleanup_before=False
+                    )
+                    if audio_path and not cancel_event.is_set():
+                        duration = get_audio_duration_seconds(audio_path)
+                        event_queue.put(("audio_ready", (audio_path, duration)))
+                except Exception as e:
+                    # 单句合成失败不应该让这一轮回答后面的语音全部哑掉。
+                    print("[TTS] Failed to synthesize one chunk, skipping it:", repr(chunk)[:80], e)
+        finally:
+            event_queue.put(("tts_done", None))
+
+    threading.Thread(target=llm_worker, daemon=True).start()
+    threading.Thread(target=tts_worker, daemon=True).start()
+
+    reply_text = ""
+    last_yielded_text = ""
+    last_text_yield_time = 0.0
+    audio_pending: List[Tuple[str, float]] = []
+    next_audio_allowed_at = 0.0
+    llm_done = False
+    tts_done = False
+
+    while True:
+        if cancel_event.is_set():
+            yield ReplyUpdate(reply_text, None, True)
+            return
+
+        try:
+            kind, payload = event_queue.get(timeout=0.05)
+            if kind == "token":
+                reply_text += payload
+            elif kind == "audio_ready":
+                audio_pending.append(payload)
+            elif kind == "llm_done":
+                llm_done = True
+            elif kind == "tts_done":
+                tts_done = True
+        except queue.Empty:
+            pass
+
+        now = time.monotonic()
+        audio_to_play: Optional[str] = None
+        if audio_pending and now >= next_audio_allowed_at:
+            path, duration = audio_pending.pop(0)
+            audio_to_play = path
+            next_audio_allowed_at = now + max(duration, 0.3) + 0.15
+
+        finished = llm_done and tts_done and not audio_pending and now >= next_audio_allowed_at
+        text_changed = reply_text != last_yielded_text
+        should_yield_text = text_changed and (now - last_text_yield_time > 0.08 or audio_to_play or finished)
+
+        if audio_to_play or should_yield_text or finished:
+            last_yielded_text = reply_text
+            last_text_yield_time = now
+            yield ReplyUpdate(reply_text, audio_to_play, finished)
+
+        if finished:
+            return
+
+
+# ============================================================
 # Gradio event functions
 # ============================================================
+def text_chat_stream(
+    provider: str,
+    tts_provider: str,
+    system_prompt: str,
+    whisper_language: str,
+    user_message: str,
+    chatbot_history: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+):
+    # 用户输入本身也可能是 OpenAI-compatible JSON block 的字符串形式，先清理再显示/发送。
+    user_message = normalize_llm_reply_content(user_message)
+    chatbot_history = chatbot_history or []
+
+    if not user_message:
+        yield clean_chatbot_history_for_display(chatbot_history), "", gr.update(value=None), get_teacher_idle_path(), ""
+        return
+
+    cancel_event = start_new_turn()
+    cleanup_temp_audio_files()
+
+    base_history = clean_chatbot_history_for_display(chatbot_history)
+    live_history = base_history + [{"role": "user", "content": user_message}]
+    yield live_history, "", gr.update(value=None), get_teacher_idle_path(), user_message
+
+    messages = build_chat_messages(system_prompt, user_message, chatbot_history)
+
+    # 点击"停止朗读/停止回答"时，Gradio 会直接打断这个生成器；try/finally 保证
+    # 不管是正常生成完、被打断还是出错，取消令牌都会被设置。
+    try:
+        for update in run_streaming_chat_reply(
+            provider=provider,
+            tts_provider=tts_provider,
+            messages=messages,
+            whisper_language=whisper_language,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            cancel_event=cancel_event,
+        ):
+            reply_text = normalize_llm_reply_content(update.text)
+            audio_path = update.audio_path
+
+            if update.done:
+                # pyttsx3 需要看到完整回复才能正确处理 Speaker 1/2 配音，等到这里再合成一次、播放一次。
+                if tts_provider == "pyttsx3" and reply_text.strip():
+                    audio_path = synthesize_tts_file(
+                        tts_provider, reply_text, whisper_language=whisper_language, cleanup_before=False
+                    )
+                new_history = append_chat_history(chatbot_history, user_message, reply_text)
+                # 只有在这一步真的合成出新音频（pyttsx3 一次性合成）时才更新 Audio 组件；
+                # 如果 edge-tts/OpenAI TTS 的最后一句已经在前面的步骤播放了，这里用 gr.skip()
+                # 而不是清空，否则会把还没放完的最后一句提前打断。
+                yield (
+                    new_history,
+                    "",
+                    audio_path if audio_path else gr.skip(),
+                    get_teacher_speaking_path() if audio_path else get_teacher_idle_path(),
+                    user_message,
+                )
+            else:
+                current_history = live_history + ([{"role": "assistant", "content": reply_text}] if reply_text else [])
+                yield (
+                    current_history,
+                    gr.skip(),
+                    audio_path if audio_path else gr.skip(),
+                    get_teacher_speaking_path() if audio_path else gr.skip(),
+                    gr.skip(),
+                )
+    finally:
+        cancel_event.set()
+
+
+def voice_chat_stream(
+    provider: str,
+    tts_provider: str,
+    system_prompt: str,
+    whisper_language: str,
+    audio_path: Optional[str],
+    chatbot_history: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+):
+    chatbot_history = chatbot_history or []
+
+    if not audio_path:
+        yield (
+            chatbot_history,
+            "没有收到录音文件。请先录音，停止录音后会自动发送。",
+            gr.update(value=None),
+            gr.update(value=None),
+            get_teacher_idle_path(),
+        )
+        return
+
+    transcript = normalize_llm_reply_content(transcribe_audio(audio_path, whisper_language))
+
+    if not transcript:
+        yield (
+            chatbot_history,
+            "Whisper 没有识别到语音。请说长一点、声音大一点，并确认麦克风权限正常。",
+            gr.update(value=None),
+            gr.update(value=None),
+            get_teacher_idle_path(),
+        )
+        return
+
+    cancel_event = start_new_turn()
+    cleanup_temp_audio_files()
+
+    base_history = clean_chatbot_history_for_display(chatbot_history)
+    live_history = base_history + [{"role": "user", "content": transcript}]
+    yield live_history, transcript, gr.update(value=None), gr.update(value=None), get_teacher_idle_path()
+
+    messages = build_chat_messages(system_prompt, transcript, chatbot_history)
+
+    try:
+        for update in run_streaming_chat_reply(
+            provider=provider,
+            tts_provider=tts_provider,
+            messages=messages,
+            whisper_language=whisper_language,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            cancel_event=cancel_event,
+        ):
+            reply_text = normalize_llm_reply_content(update.text)
+            audio_path_out = update.audio_path
+
+            if update.done:
+                if tts_provider == "pyttsx3" and reply_text.strip():
+                    audio_path_out = synthesize_tts_file(
+                        tts_provider, reply_text, whisper_language=whisper_language, cleanup_before=False
+                    )
+                new_history = append_chat_history(chatbot_history, transcript, reply_text)
+                # 只有在这一步真的合成出新音频（pyttsx3 一次性合成）时才更新 Audio 组件；
+                # 如果 edge-tts/OpenAI TTS 的最后一句已经在前面的步骤播放了，这里用 gr.skip()
+                # 而不是清空，否则会把还没放完的最后一句提前打断。
+                yield (
+                    new_history,
+                    transcript,
+                    audio_path_out if audio_path_out else gr.skip(),
+                    gr.skip(),
+                    get_teacher_speaking_path() if audio_path_out else get_teacher_idle_path(),
+                )
+            else:
+                current_history = live_history + ([{"role": "assistant", "content": reply_text}] if reply_text else [])
+                yield (
+                    current_history,
+                    gr.skip(),
+                    audio_path_out if audio_path_out else gr.skip(),
+                    gr.skip(),
+                    get_teacher_speaking_path() if audio_path_out else gr.skip(),
+                )
+    finally:
+        cancel_event.set()
+
+
 def append_chat_history(chatbot_history: List[Dict[str, str]], user_message: str, assistant_reply: str) -> List[Dict[str, str]]:
     chatbot_history = chatbot_history or []
 
@@ -1071,75 +1554,6 @@ def append_chat_history(chatbot_history: List[Dict[str, str]], user_message: str
 
     # 返回给 Gradio Chatbot 前再清理一次，确保「② 用户输入 / 对话」只显示干净文本。
     return clean_chatbot_history_for_display(chatbot_history)
-
-
-def text_chat_once(
-    provider: str,
-    tts_provider: str,
-    system_prompt: str,
-    whisper_language: str,
-    user_message: str,
-    chatbot_history: List[Dict[str, str]],
-    temperature: float,
-    max_tokens: int,
-):
-    # 用户输入本身也可能是 OpenAI-compatible JSON block 的字符串形式，先清理再显示/发送。
-    user_message = normalize_llm_reply_content(user_message)
-    chatbot_history = chatbot_history or []
-
-    if not user_message:
-        return clean_chatbot_history_for_display(chatbot_history), "", None, get_teacher_idle_path(), ""
-
-    raw_reply = call_llm(provider, system_prompt, user_message, chatbot_history, temperature, max_tokens)
-    reply = normalize_llm_reply_content(raw_reply)
-
-    # TTS 和 Chatbot 都使用过滤后的文本，避免朗读/显示 API 原始 JSON。
-    audio_reply = synthesize_tts_file(tts_provider, reply, whisper_language=whisper_language, cleanup_before=True)
-    new_history = append_chat_history(chatbot_history, user_message, reply)
-
-    return clean_chatbot_history_for_display(new_history), "", audio_reply, get_teacher_speaking_path(), user_message
-
-
-def voice_chat_once(
-    provider: str,
-    tts_provider: str,
-    system_prompt: str,
-    whisper_language: str,
-    audio_path: Optional[str],
-    chatbot_history: List[Dict[str, str]],
-    temperature: float,
-    max_tokens: int,
-):
-    chatbot_history = chatbot_history or []
-
-    if not audio_path:
-        return (
-            chatbot_history,
-            "没有收到录音文件。请先录音，停止录音后会自动发送。",
-            None,
-            gr.update(value=None),
-            get_teacher_idle_path(),
-        )
-
-    transcript = normalize_llm_reply_content(transcribe_audio(audio_path, whisper_language))
-
-    if not transcript:
-        return (
-            chatbot_history,
-            "Whisper 没有识别到语音。请说长一点、声音大一点，并确认麦克风权限正常。",
-            None,
-            gr.update(value=None),
-            get_teacher_idle_path(),
-        )
-
-    raw_reply = call_llm(provider, system_prompt, transcript, chatbot_history, temperature, max_tokens)
-    reply = normalize_llm_reply_content(raw_reply)
-
-    # TTS 和 Chatbot 都使用过滤后的文本，避免朗读/显示 API 原始 JSON。
-    audio_reply = synthesize_tts_file(tts_provider, reply, whisper_language=whisper_language, cleanup_before=True)
-    new_history = append_chat_history(chatbot_history, transcript, reply)
-
-    return clean_chatbot_history_for_display(new_history), transcript, audio_reply, gr.update(value=None), get_teacher_speaking_path()
 
 
 def clear_chat() -> List[Dict[str, str]]:
@@ -1235,8 +1649,8 @@ with gr.Blocks(title="My Local Voice ChatGPT") as demo:
     gr.HTML(
         """
         <div id="main_title">
-          <h1>My Local Voice ChatGPT</h1>
-          <p>本地运行 · 自定义 My ChatGPT · 文字输入 / 语音输入 · 自动朗读 · 老师头像切换</p>
+          <h1>My Local Voice ChatGPT · 低延迟版</h1>
+          <p>本地运行 · 自定义 My ChatGPT · 文字输入 / 语音输入 · 流式回答 · 边生成边朗读 · 老师头像切换</p>
         </div>
         """
     )
@@ -1256,7 +1670,7 @@ with gr.Blocks(title="My Local Voice ChatGPT") as demo:
                 choices=["edge-tts", "pyttsx3", "OpenAI TTS API"],
                 value="pyttsx3",
                 label="TTS 朗读方式",
-                info="edge-tts 需要联网；pyttsx3 更接近完全本地；OpenAI TTS API 需要 OpenAI Key。",
+                info="edge-tts / OpenAI TTS API 会边生成边朗读，延迟更低；pyttsx3 支持 Speaker 1/2 双人配音，但要等回答生成完才朗读。",
             )
 
             whisper_language = gr.Radio(
@@ -1265,6 +1679,8 @@ with gr.Blocks(title="My Local Voice ChatGPT") as demo:
                 label="Whisper 语音识别语言",
                 info="默认英语；如果要说日语或中文，请在这里切换。混合语言时可选 Auto Detect。",
             )
+
+            stop_answer_btn = gr.Button("停止朗读 / 停止回答", size="sm")
 
             system_prompt = gr.Textbox(
                 label="My ChatGPT 设定 / System Prompt",
@@ -1307,7 +1723,7 @@ PowerShell 修改例子：
 
 `$env:LOCAL_LLM_MODEL="你的模型名"`
 
-`$env:WHISPER_MODEL_NAME="base"`
+`$env:WHISPER_MODEL_NAME="base"`（更快，但中文/日文识别会变差）
 
 `$env:EDGE_TTS_EN_VOICE="en-US-JennyNeural"`
 
@@ -1385,16 +1801,19 @@ PowerShell 修改例子：
 
             export_file = gr.File(label="下载导出的对话记录")
 
-    send_btn.click(
-        fn=text_chat_once,
-        inputs=[provider, tts_provider, system_prompt, whisper_language, user_input, chatbot, temperature, max_tokens],
-        outputs=[chatbot, user_input, audio_reply_output, teacher_image, transcript_output],
+    _chat_inputs = [provider, tts_provider, system_prompt, whisper_language, user_input, chatbot, temperature, max_tokens]
+    _chat_outputs = [chatbot, user_input, audio_reply_output, teacher_image, transcript_output]
+
+    send_click_event = send_btn.click(
+        fn=text_chat_stream,
+        inputs=_chat_inputs,
+        outputs=_chat_outputs,
     )
 
-    user_input.submit(
-        fn=text_chat_once,
-        inputs=[provider, tts_provider, system_prompt, whisper_language, user_input, chatbot, temperature, max_tokens],
-        outputs=[chatbot, user_input, audio_reply_output, teacher_image, transcript_output],
+    submit_event = user_input.submit(
+        fn=text_chat_stream,
+        inputs=_chat_inputs,
+        outputs=_chat_outputs,
     )
 
     clear_btn.click(
@@ -1429,7 +1848,7 @@ PowerShell 修改例子：
     except Exception as e:
         print("[Avatar] Audio event binding skipped:", e)
 
-    # 录音停止后自动执行：Whisper -> LLM -> TTS -> 更新对话历史。
+    # 录音停止后自动执行：Whisper -> LLM 流式回答 -> 边生成边朗读 -> 更新对话历史。
     _voice_outputs = [
         chatbot,
         transcript_output,
@@ -1437,23 +1856,40 @@ PowerShell 修改例子：
         audio_input,
         teacher_image,
     ]
+    _voice_inputs = [provider, tts_provider, system_prompt, whisper_language, audio_input, chatbot, temperature, max_tokens]
 
+    voice_stream_event = None
     try:
-        audio_input.stop_recording(
-            fn=voice_chat_once,
-            inputs=[provider, tts_provider, system_prompt, whisper_language, audio_input, chatbot, temperature, max_tokens],
+        voice_stream_event = audio_input.stop_recording(
+            fn=voice_chat_stream,
+            inputs=_voice_inputs,
             outputs=_voice_outputs,
         )
     except Exception as e:
         print("[UI] audio_input.stop_recording binding failed, fallback to change:", e)
         try:
-            audio_input.change(
-                fn=voice_chat_once,
-                inputs=[provider, tts_provider, system_prompt, whisper_language, audio_input, chatbot, temperature, max_tokens],
+            voice_stream_event = audio_input.change(
+                fn=voice_chat_stream,
+                inputs=_voice_inputs,
                 outputs=_voice_outputs,
             )
         except Exception as change_error:
             print("[UI] audio_input.change binding also failed:", change_error)
+
+    # 点击"停止朗读/停止回答"：
+    # 1. 用 Gradio 自带的 cancels 立刻打断正在跑的生成器（不用等它自己跑完）。
+    # 2. 顺手把取消令牌也标记一下，让还在后台跑的 LLM/TTS 线程尽快收手。
+    # 3. 清空回答朗读的 Audio 组件。
+    _cancel_targets = [send_click_event, submit_event]
+    if voice_stream_event is not None:
+        _cancel_targets.append(voice_stream_event)
+
+    stop_answer_btn.click(
+        fn=stop_current_turn_ui,
+        inputs=None,
+        outputs=[audio_reply_output, teacher_image],
+        cancels=_cancel_targets,
+    )
 
 
 if __name__ == "__main__":

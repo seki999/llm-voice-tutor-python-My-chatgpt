@@ -4,3 +4,4 @@ requests
 faster-whisper
 pyttsx3
 edge-tts
+mutagen
