@@ -13,9 +13,78 @@
 
 ## 安装
 
+### 1. 配置本地 Python 环境（推荐使用虚拟环境）
+
+以下步骤以 Windows 11 + PowerShell 为例。
+
+先确认已经安装 Python：
+
+```powershell
+python --version
+```
+
+如果 `python` 命令不可用，也可以尝试：
+
+```powershell
+py --version
+```
+
+进入项目目录：
+
 ```powershell
 cd C:\Users\sekine\Documents\llm-voice-tutor-python-My-chatgpt
+```
+
+创建 Python 虚拟环境：
+
+```powershell
+python -m venv .venv
+```
+
+如果你的电脑使用的是 `py` 命令，则执行：
+
+```powershell
+py -m venv .venv
+```
+
+激活虚拟环境：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+激活成功后，PowerShell 命令行前面通常会显示：
+
+```text
+(.venv)
+```
+
+如果 PowerShell 提示 `Activate.ps1` 无法运行、脚本未进行数字签名或执行策略禁止运行，可以只针对当前 PowerShell 窗口临时允许脚本执行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+```
+
+然后重新激活：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+> `-Scope Process` 只对当前 PowerShell 窗口有效，关闭窗口后设置会自动失效，不会永久修改系统执行策略。
+
+### 2. 安装 Python 依赖
+
+确认命令行前面已经显示 `(.venv)`，然后执行：
+
+```powershell
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+```
+
+### 3. 启动程序
+
+```powershell
 python app.py
 ```
 
@@ -23,6 +92,14 @@ python app.py
 
 ```text
 http://127.0.0.1:7861
+```
+
+以后再次启动项目时，不需要重新创建虚拟环境，只需要进入项目目录并激活已有的 `.venv`：
+
+```powershell
+cd C:\Users\sekine\Documents\llm-voice-tutor-python-My-chatgpt
+.\.venv\Scripts\Activate.ps1
+python app.py
 ```
 
 ## 使用 OpenAI API
