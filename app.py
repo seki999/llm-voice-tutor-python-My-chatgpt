@@ -2174,6 +2174,7 @@ if __name__ == "__main__":
         server_name="127.0.0.1",
         server_port=7861,
         share=False,
+        inbrowser=True,
         allowed_paths=[str(APP_DIR), tempfile.gettempdir()],
         css=CUSTOM_CSS,
     )
